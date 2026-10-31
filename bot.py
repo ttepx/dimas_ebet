@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import hmac
 import html
 import json
@@ -13,6 +14,7 @@ from datetime import date
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
@@ -292,11 +294,64 @@ def too_fast(user_id: int, seconds: float = 3.0) -> bool:
 
 async def answer_with_ai(message, system, prompt, fallback_fn, thinking="🧠 Думаю..."):
     """Одне статус-повідомлення, одна заміна, а якщо ШІ мовчить, виходить заглушка."""
-    status = await message.reply(thinking)
+    token = _skip_outbound_ai.set(True)
+    try:
+        status = await message.reply(thinking)
+    finally:
+        _skip_outbound_ai.reset(token)
     text = await ask_ai(system, prompt)
     result = text if text else fallback_fn()
-    await safe_edit(status, fmt_ai(text) if text else result)
+    token = _skip_outbound_ai.set(True)
+    try:
+        await safe_edit(status, fmt_ai(text) if text else result)
+    finally:
+        _skip_outbound_ai.reset(token)
     return result
+
+
+_skip_outbound_ai = contextvars.ContextVar("skip_outbound_ai", default=False)
+
+
+async def process_outbound_text(text: str, max_length: int) -> str:
+    """Uses the free AI cascade to process a system response, retaining it on failure."""
+    system = (
+        "Ти — перший шар відповіді Telegram-бота. Відредагуй надану відповідь, "
+        "зберігаючи її зміст, усі факти, числа, імена, посилання, форматування та HTML-теги. "
+        "Не додавай нових фактів, пояснень чи обрамлення. Поверни лише готовий текст. "
+        "Якщо не можеш надійно зберегти зміст, поверни рівно __AI_CANNOT_PROCESS__."
+    )
+    processed = await ask_ai(system, text, temperature=0.2)
+    if not processed or processed == "__AI_CANNOT_PROCESS__" or len(processed) > max_length:
+        return text
+
+    original_tags = re.findall(r"</?[a-zA-Z][^>]*>", text)
+    processed_tags = re.findall(r"</?[a-zA-Z][^>]*>", processed)
+    if processed_tags != original_tags:
+        logging.warning("ШІ змінив HTML-теги відповіді; залишено системний текст")
+        return text
+    return processed
+
+
+class AIProcessingSession(AiohttpSession):
+    """Processes every outbound Telegram text through the free AI cascade."""
+
+    async def make_request(self, bot, method, timeout=None):
+        if not _skip_outbound_ai.get():
+            api_method = method.__api_method__
+            fields = {
+                "sendMessage": ("text", 4096),
+                "editMessageText": ("text", 4096),
+                "answerCallbackQuery": ("text", 200),
+                "sendPoll": ("question", 300),
+            }
+            field = fields.get(api_method)
+            if field:
+                name, max_length = field
+                original = getattr(method, name, None)
+                if isinstance(original, str) and original.strip():
+                    processed = await process_outbound_text(original, max_length)
+                    setattr(method, name, processed)
+        return await super().make_request(bot, method, timeout)
 
 
 # ======================================================================
@@ -1050,7 +1105,11 @@ async def main():
     if not config.BOT_TOKEN:
         raise SystemExit("❌ Не знайдено BOT_TOKEN. Створи файл .env за зразком .env.example")
 
-    bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(
+        token=config.BOT_TOKEN,
+        session=AIProcessingSession(),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     logging.info("🚀 Бот із чорним гумором запускається")
     if config.WEBHOOK_BASE_URL:
         await run_webhook(bot)
