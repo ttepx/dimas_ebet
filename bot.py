@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import time
 from collections import Counter, defaultdict, deque
 from datetime import date
@@ -998,10 +999,15 @@ def create_web_app(bot, secret):
     return app
 
 
-async def run_webhook(bot):
-    secret = config.WEBHOOK_SECRET
+def get_webhook_secret():
+    secret = config.WEBHOOK_SECRET or secrets.token_urlsafe(32)
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
         raise SystemExit("❌ WEBHOOK_SECRET має містити 1-256 символів A-Z, a-z, 0-9, _ або -")
+    return secret
+
+
+async def run_webhook(bot):
+    secret = get_webhook_secret()
 
     app = create_web_app(bot, secret)
     runner = web.AppRunner(app)
