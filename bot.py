@@ -974,9 +974,13 @@ async def run_polling(bot):
 
 def create_web_app(bot, secret):
     async def health(request):
+        if not request.app["ready"]:
+            raise web.HTTPServiceUnavailable(text="Bot is starting")
         return web.json_response({"status": "ok", "service": request.app["service"]})
 
     async def receive_update(request):
+        if not request.app["ready"]:
+            raise web.HTTPServiceUnavailable(text="Bot is starting")
         received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not hmac.compare_digest(received_secret, secret):
             raise web.HTTPUnauthorized()
@@ -988,6 +992,7 @@ def create_web_app(bot, secret):
 
     app = web.Application()
     app["service"] = "dimas-ebet-bot"
+    app["ready"] = False
     app.router.add_get("/", health)
     app.router.add_post("/telegram/webhook", receive_update)
     return app
@@ -998,24 +1003,39 @@ async def run_webhook(bot):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
         raise SystemExit("❌ WEBHOOK_SECRET має містити 1-256 символів A-Z, a-z, 0-9, _ або -")
 
-    webhook_url = f"{config.WEBHOOK_BASE_URL}/telegram/webhook"
     app = create_web_app(bot, secret)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080")))
-    stop_event = asyncio.Event()
-    autosave_task = asyncio.create_task(autosave(stop_event))
+    autosave_task = None
     try:
         await site.start()
+        logging.info("HTTP server listening; initializing bot")
+        if not config.DATABASE_URL:
+            raise SystemExit("❌ Для webhook-режиму задай DATABASE_URL для постійного збереження даних.")
+
+        await asyncio.to_thread(load_data)
+        init_providers()
+        try:
+            await bot.set_my_commands(BOT_COMMANDS)
+        except Exception as e:
+            logging.warning("Не вдалось встановити меню команд: %s", e)
+
+        webhook_url = f"{config.WEBHOOK_BASE_URL}/telegram/webhook"
         await bot.set_webhook(
             webhook_url,
             secret_token=secret,
             allowed_updates=dp.resolve_used_update_types(),
         )
+        app["ready"] = True
+        stop_event = asyncio.Event()
+        autosave_task = asyncio.create_task(autosave(stop_event))
         logging.info("Webhook запущено: %s", webhook_url)
         await asyncio.Event().wait()
     finally:
-        await stop_autosave(stop_event, autosave_task)
+        app["ready"] = False
+        if autosave_task is not None:
+            await stop_autosave(stop_event, autosave_task)
         await runner.cleanup()
         await bot.session.close()
 
@@ -1023,24 +1043,18 @@ async def run_webhook(bot):
 async def main():
     if not config.BOT_TOKEN:
         raise SystemExit("❌ Не знайдено BOT_TOKEN. Створи файл .env за зразком .env.example")
-    if config.WEBHOOK_BASE_URL and not config.DATABASE_URL:
-        raise SystemExit("❌ Для webhook-режиму задай DATABASE_URL для постійного збереження даних.")
-    if config.WEBHOOK_BASE_URL and not re.fullmatch(
-        r"[A-Za-z0-9_-]{1,256}", config.WEBHOOK_SECRET
-    ):
-        raise SystemExit("❌ WEBHOOK_SECRET має містити 1-256 символів A-Z, a-z, 0-9, _ або -")
 
-    await asyncio.to_thread(load_data)
-    init_providers()
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    try:
-        await bot.set_my_commands(BOT_COMMANDS)
-    except Exception as e:
-        logging.warning("Не вдалось встановити меню команд: %s", e)
     logging.info("🚀 Бот із чорним гумором запускається")
     if config.WEBHOOK_BASE_URL:
         await run_webhook(bot)
     else:
+        init_providers()
+        await asyncio.to_thread(load_data)
+        try:
+            await bot.set_my_commands(BOT_COMMANDS)
+        except Exception as e:
+            logging.warning("Не вдалось встановити меню команд: %s", e)
         await run_polling(bot)
 
 
