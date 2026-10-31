@@ -2,3 +2,5 @@ aiogram>=3.13
 openai>=1.40
 google-genai
 python-dotenv
+aiohttp>=3.9
+psycopg[binary]>=3.2

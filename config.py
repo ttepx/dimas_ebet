@@ -24,6 +24,11 @@ BOT_TOKEN = _key("BOT_TOKEN")
 GROQ_API_KEY = _key("GROQ_API_KEY")
 OPENROUTER_API_KEY = _key("OPENROUTER_API_KEY")
 GEMINI_API_KEY = _key("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+WEBHOOK_BASE_URL = (
+    os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+).strip().rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 # У списку навмисно залишені лише провайдери та моделі з безкоштовним режимом.
 PROVIDER_ORDER = os.getenv("PROVIDER_ORDER", "groq,openrouter,gemini")

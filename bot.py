@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import html
 import json
 import logging
@@ -20,7 +21,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods.base import TelegramMethod
 from aiogram.types import BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web
 from openai import AsyncOpenAI
+import psycopg
 
 try:
     from google import genai
@@ -44,18 +47,44 @@ _dirty = False
 
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, encoding="utf-8") as f:
-                DATA.update(json.load(f))
-        except Exception as e:
-            logging.warning("Не вдалось прочитати %s: %s", DATA_FILE, e)
+    if config.DATABASE_URL:
+        with psycopg.connect(config.DATABASE_URL, connect_timeout=15) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        id SMALLINT PRIMARY KEY CHECK (id = 1),
+                        data JSONB NOT NULL
+                    )
+                    """
+                )
+                cursor.execute(
+                    "INSERT INTO bot_state (id, data) VALUES (1, %s::jsonb) "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (json.dumps(DATA, ensure_ascii=False),),
+                )
+                cursor.execute("SELECT data FROM bot_state WHERE id = 1")
+                stored_data = cursor.fetchone()[0]
+        DATA.update(stored_data)
+    elif os.path.exists(DATA_FILE):
+        with open(DATA_FILE, encoding="utf-8") as f:
+            DATA.update(json.load(f))
 
 
-def save_data():
+def save_data(snapshot=None):
+    serialized = snapshot or json.dumps(DATA, ensure_ascii=False)
+    if config.DATABASE_URL:
+        with psycopg.connect(config.DATABASE_URL, connect_timeout=15) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO bot_state (id, data) VALUES (1, %s::jsonb) "
+                    "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+                    (serialized,),
+                )
+        return
     tmp = DATA_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(DATA, f, ensure_ascii=False)
+        f.write(serialized)
     os.replace(tmp, DATA_FILE)
 
 
@@ -64,16 +93,21 @@ def mark_dirty():
     _dirty = True
 
 
-async def autosave():
+async def autosave(stop_event):
     global _dirty
-    while True:
-        await asyncio.sleep(30)
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
         if _dirty:
             _dirty = False
             try:
-                save_data()
-            except Exception as e:
-                logging.warning("Автозбереження не вдалось: %s", e)
+                snapshot = json.dumps(DATA, ensure_ascii=False)
+                await asyncio.to_thread(save_data, snapshot)
+            except Exception:
+                _dirty = True
+                logging.exception("Автозбереження не вдалось")
 
 
 # Пам'ять без збереження: історія чату та хто недавно писав
@@ -922,22 +956,92 @@ async def intent_srach(message: types.Message):
 INTENTS.update({"факт": intent_fact, "вірю": intent_vir, "суд": intent_sud, "срач": intent_srach})
 
 
+async def stop_autosave(stop_event, task):
+    stop_event.set()
+    await task
+    snapshot = json.dumps(DATA, ensure_ascii=False)
+    await asyncio.to_thread(save_data, snapshot)
+
+
+async def run_polling(bot):
+    stop_event = asyncio.Event()
+    autosave_task = asyncio.create_task(autosave(stop_event))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await stop_autosave(stop_event, autosave_task)
+
+
+def create_web_app(bot, secret):
+    async def health(request):
+        return web.json_response({"status": "ok", "service": request.app["service"]})
+
+    async def receive_update(request):
+        received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(received_secret, secret):
+            raise web.HTTPUnauthorized()
+
+        update_data = await request.json()
+        update = types.Update.model_validate(update_data, context={"bot": bot})
+        await dp.feed_update(bot, update)
+        return web.Response()
+
+    app = web.Application()
+    app["service"] = "dimas-ebet-bot"
+    app.router.add_get("/", health)
+    app.router.add_post("/telegram/webhook", receive_update)
+    return app
+
+
+async def run_webhook(bot):
+    secret = config.WEBHOOK_SECRET
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
+        raise SystemExit("❌ WEBHOOK_SECRET має містити 1-256 символів A-Z, a-z, 0-9, _ або -")
+
+    webhook_url = f"{config.WEBHOOK_BASE_URL}/telegram/webhook"
+    app = create_web_app(bot, secret)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080")))
+    stop_event = asyncio.Event()
+    autosave_task = asyncio.create_task(autosave(stop_event))
+    try:
+        await site.start()
+        await bot.set_webhook(
+            webhook_url,
+            secret_token=secret,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+        logging.info("Webhook запущено: %s", webhook_url)
+        await asyncio.Event().wait()
+    finally:
+        await stop_autosave(stop_event, autosave_task)
+        await runner.cleanup()
+        await bot.session.close()
+
+
 async def main():
     if not config.BOT_TOKEN:
         raise SystemExit("❌ Не знайдено BOT_TOKEN. Створи файл .env за зразком .env.example")
-    load_data()
+    if config.WEBHOOK_BASE_URL and not config.DATABASE_URL:
+        raise SystemExit("❌ Для webhook-режиму задай DATABASE_URL для постійного збереження даних.")
+    if config.WEBHOOK_BASE_URL and not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,256}", config.WEBHOOK_SECRET
+    ):
+        raise SystemExit("❌ WEBHOOK_SECRET має містити 1-256 символів A-Z, a-z, 0-9, _ або -")
+
+    await asyncio.to_thread(load_data)
     init_providers()
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     try:
         await bot.set_my_commands(BOT_COMMANDS)
     except Exception as e:
         logging.warning("Не вдалось встановити меню команд: %s", e)
-    asyncio.create_task(autosave())
-    print("🚀 Бот із чорним гумором запущено!")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        save_data()
+    logging.info("🚀 Бот із чорним гумором запускається")
+    if config.WEBHOOK_BASE_URL:
+        await run_webhook(bot)
+    else:
+        await run_polling(bot)
 
 
 if __name__ == "__main__":
