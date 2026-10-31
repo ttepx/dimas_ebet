@@ -1,0 +1,4 @@
+aiogram>=3.13
+openai>=1.40
+google-genai
+python-dotenv

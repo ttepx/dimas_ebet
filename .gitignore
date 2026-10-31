@@ -1,0 +1,5 @@
+.env
+.venv/
+__pycache__/
+bot_data.json
+.DS_Store
