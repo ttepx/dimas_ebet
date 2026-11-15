@@ -711,12 +711,21 @@ def question_kind(query: str) -> str:
 
 
 def compose_fallback(style: str, query: str, users: list) -> str:
-    """Заглушка, яка не повторюється: відкривашка + вердикт + закінчення."""
-    data = FALLBACK.get(style) or FALLBACK["standup"]
-    user = html.escape(random.choice(users)) if users else "Хтось із чату"
-    fmt = {"user": f"<b>{user}</b>", "pct": f"<b>{round(random.uniform(61, 99.9), 1)}</b>"}
-    parts = [pick(data["open"]), pick(data[question_kind(query)]), pick(data["close"])]
-    return "\n\n".join(p.format(**fmt) for p in parts)
+    """Returns a contextual, non-accusatory line only when every AI provider is unavailable."""
+    if question_kind(query) == "who":
+        asker = users[-1] if users else "автор питання"
+        return compose_who_fallback(style, asker, users, query)
+
+    text = html.escape(query.strip()[:160])
+    lines = {
+        "standup": f"🎤 «{text}» — це все питання чи лише трейлер? Додай продовження, поки мій Шерлок не пішов у стендап.",
+        "shizo": f"👽 Сигнал «{text}» обірвався: голуб-агент з'їв решту повідомлення. Передай повну версію.",
+        "gopnik": f"🧢 Брат, «{text}» — це думка чи її демоверсія? Договорюй, бо я не ворожка з під'їзду.",
+        "viber": f"📱 Людоньки, «{text}» — це вже все? Допиши думку, бо плітка без контексту — як борщ без каструлі.",
+        "philosopher": f"🌫 «{text}» — лише уламок думки; продовж її, поки сенс не пішов у вічність без адреси.",
+        "dictator": f"🪖 Повідомлення «{text}» визнано неповним. Наказую дописати решту, поки канцелярія не заснула.",
+    }
+    return lines.get(style, lines["standup"])
 
 
 def compose_who_fallback(style: str, asker: str, users: list, query: str) -> str:
