@@ -185,6 +185,7 @@ class SetChatMemberTag(TelegramMethod[bool]):
 OPENAI_COMPATIBLE = {
     "groq": ("https://api.groq.com/openai/v1", config.GROQ_API_KEY),
     "openrouter": ("https://openrouter.ai/api/v1", config.OPENROUTER_API_KEY),
+    "mistral": ("https://api.mistral.ai/v1", config.MISTRAL_API_KEY),
 }
 
 
